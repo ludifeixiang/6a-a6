@@ -20,6 +20,9 @@ import signal
 from dataclasses import dataclass
 from aiohttp import web
 
+os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+os.environ.setdefault('GLOG_minloglevel', '2')
+
 try:
     import fcntl
     import pty
@@ -1495,7 +1498,8 @@ class NezhaPythonClient:
             timeout=10,
             metadata=self.config.metadata,
         )
-        logger.info(f'✅ embedded Nezha client connected to {self.config.server}, dashboard boot: {receipt.data}')
+        if DEBUG:
+            logger.debug(f'embedded Nezha client connected to {self.config.server}, dashboard boot: {receipt.data}')
         stop_event = asyncio.Event()
         result_queue = asyncio.Queue()
         tasks = [
