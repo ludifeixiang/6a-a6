@@ -22,6 +22,9 @@ from aiohttp import web
 
 os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
 os.environ.setdefault('GLOG_minloglevel', '2')
+os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
+os.environ.setdefault('no_proxy', '*')
+os.environ.setdefault('NO_PROXY', '*')
 
 try:
     import fcntl
@@ -1134,6 +1137,8 @@ class NezhaIOStreamSession:
     async def _outgoing(self):
         while not self.closed:
             message = await self.queue.get()
+            if message is None:
+                break
             yield message
 
     async def keepalive(self):
@@ -1143,6 +1148,7 @@ class NezhaIOStreamSession:
 
     async def close(self):
         self.closed = True
+        await self.queue.put(None)
         if self.call is not None:
             self.call.cancel()
 
@@ -1344,6 +1350,7 @@ class NezhaTerminalSession:
                 logger.error(f'Nezha terminal session error: {e}')
         finally:
             self.closed = True
+            await self.queue.put(None)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1369,6 +1376,8 @@ class NezhaTerminalSession:
         self.master_fd = master_fd
 
     async def _send(self, data):
+        if self.closed:
+            return
         message = self.client.proto.IOStreamData()
         message.data = data
         await self.queue.put(message)
@@ -1376,6 +1385,8 @@ class NezhaTerminalSession:
     async def _outgoing(self):
         while not self.closed:
             message = await self.queue.get()
+            if message is None:
+                break
             yield message
 
     async def _keepalive(self):
@@ -1437,7 +1448,7 @@ class NezhaTerminalSession:
                     os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
                 else:
                     self.process.terminate()
-                await asyncio.to_thread(self.process.wait, 2)
+                await asyncio.wait_for(asyncio.to_thread(self.process.wait), timeout=2)
             except Exception:
                 try:
                     if hasattr(os, 'killpg'):
@@ -1526,6 +1537,7 @@ class NezhaPythonClient:
             ('grpc.keepalive_timeout_ms', 10000),
             ('grpc.keepalive_permit_without_calls', 1),
             ('grpc.max_receive_message_length', 16 * 1024 * 1024),
+            ('grpc.enable_http_proxy', 0),
         )
         if self.config.tls:
             return grpc.aio.secure_channel(self.config.server, grpc.ssl_channel_credentials(), options=options)
@@ -1780,9 +1792,19 @@ async def main():
 
     await add_access_task()
 
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     try:
-        await asyncio.Future()
-    except KeyboardInterrupt:
+        await stop_event.wait()
+    except asyncio.CancelledError:
         pass
     finally:
         if nezha_client is not None:
