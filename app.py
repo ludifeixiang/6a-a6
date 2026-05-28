@@ -1123,8 +1123,8 @@ class NezhaIOStreamSession:
         self.closed = False
 
     async def open(self):
-        await self.send(self.STREAM_ID_PREFIX + self.stream_id.encode())
         self.call = self.client.io_stream_call(self._outgoing(), metadata=self.client.config.metadata)
+        await self.send(self.STREAM_ID_PREFIX + self.stream_id.encode())
 
     async def send(self, data):
         if self.closed:
@@ -1334,8 +1334,8 @@ class NezhaTerminalSession:
         tasks = []
         try:
             self._start_shell()
-            await self._send(self.STREAM_ID_PREFIX + self.stream_id.encode())
             self.call = self.client.io_stream_call(self._outgoing(), metadata=self.client.config.metadata)
+            await self._send(self.STREAM_ID_PREFIX + self.stream_id.encode())
             tasks = [
                 asyncio.create_task(self._keepalive()),
                 asyncio.create_task(self._read_remote()),
@@ -1490,7 +1490,8 @@ class NezhaPythonClient:
                 self.running = False
                 raise
             except Exception as e:
-                logger.error(f'Nezha client disconnected: {e}')
+                if DEBUG:
+                    logger.debug(f'Nezha client disconnected: {e}')
             await self._close_channel()
             await self._close_terminals()
             await self._close_file_managers()
