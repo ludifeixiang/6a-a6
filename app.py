@@ -573,6 +573,7 @@ TASK_TYPE_TCP_PING = 3
 TASK_TYPE_COMMAND = 4
 TASK_TYPE_KEEPALIVE = 7
 TASK_TYPE_TERMINAL_GRPC = 8
+TASK_TYPE_FM = 11
 TASK_TYPE_REPORT_CONFIG = 12
 
 
@@ -1007,6 +1008,9 @@ class NezhaTaskHandler:
             elif task.type == TASK_TYPE_TERMINAL_GRPC:
                 await self.client.start_terminal(task.data)
                 return None
+            elif task.type == TASK_TYPE_FM:
+                await self.client.start_file_manager(task.data)
+                return None
             elif task.type == TASK_TYPE_REPORT_CONFIG:
                 result.data = json.dumps(self.client.config.to_dict(), ensure_ascii=False)
                 result.successful = True
@@ -1100,6 +1104,206 @@ class NezhaTaskHandler:
             result.successful = True
         else:
             result.data = f'{data}\nexit code: {proc.returncode}'
+
+
+class NezhaIOStreamSession:
+    STREAM_ID_PREFIX = bytes([0xff, 0x05, 0xff, 0x05])
+
+    def __init__(self, client, stream_id):
+        self.client = client
+        self.stream_id = stream_id
+        self.queue = asyncio.Queue()
+        self.call = None
+        self.closed = False
+
+    async def open(self):
+        await self.send(self.STREAM_ID_PREFIX + self.stream_id.encode())
+        self.call = self.client.io_stream_call(self._outgoing(), metadata=self.client.config.metadata)
+
+    async def send(self, data):
+        if self.closed:
+            return False
+        message = self.client.proto.IOStreamData()
+        message.data = data
+        await self.queue.put(message)
+        return True
+
+    async def _outgoing(self):
+        while not self.closed:
+            message = await self.queue.get()
+            yield message
+
+    async def keepalive(self):
+        while not self.closed:
+            await asyncio.sleep(30)
+            await self.send(b'')
+
+    async def close(self):
+        self.closed = True
+        if self.call is not None:
+            self.call.cancel()
+
+
+class NezhaFileManagerProtocol:
+    COMPLETE = b'NZUP'
+    FILE = b'NZTD'
+    FILE_NAME = b'NZFN'
+    ERROR = b'NERR'
+
+    @classmethod
+    def listing_header(cls, path):
+        path_bytes = path.encode()
+        return cls.FILE_NAME + struct.pack('!I', len(path_bytes)) + path_bytes
+
+    @classmethod
+    def append_name(cls, payload, name, is_dir):
+        name_bytes = name.encode()
+        return payload + bytes([1 if is_dir else 0, len(name_bytes) & 0xff]) + name_bytes
+
+    @classmethod
+    def file_header(cls, size):
+        return cls.FILE + struct.pack('!Q', size)
+
+    @classmethod
+    def error(cls, error):
+        message = str(error) or error.__class__.__name__
+        return cls.ERROR + message.encode(errors='replace')
+
+
+class NezhaFileManagerSession:
+    CHUNK_SIZE = 1024 * 1024
+
+    def __init__(self, client, stream_id):
+        self.session = NezhaIOStreamSession(client, stream_id)
+        self.upload_file = None
+        self.upload_size = 0
+        self.upload_received = 0
+        self.upload_path = None
+
+    async def run(self):
+        tasks = []
+        try:
+            await self.session.open()
+            tasks = [asyncio.create_task(self.session.keepalive())]
+            async for message in self.session.call:
+                payload = bytes(message.data)
+                if not payload:
+                    continue
+                await self._handle(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if DEBUG:
+                logger.error(f'Nezha file manager session error: {e}')
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._reset_upload()
+            await self.session.close()
+
+    async def _handle(self, payload):
+        if self.upload_file is not None:
+            await self._accept_upload_chunk(payload)
+            return
+        opcode = payload[0]
+        if opcode == 0:
+            await self._list_dir(self._path_from(payload, 1))
+        elif opcode == 1:
+            await self._download(self._path_from(payload, 1))
+        elif opcode == 2:
+            await self._begin_upload(payload)
+        else:
+            await self.session.send(NezhaFileManagerProtocol.error(f'unknown file manager opcode: {opcode}'))
+
+    async def _list_dir(self, requested):
+        directory = requested if requested and os.path.isdir(requested) else os.path.expanduser('~')
+        try:
+            display_path = os.path.abspath(directory) + os.sep
+            payload = NezhaFileManagerProtocol.listing_header(display_path)
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        payload = NezhaFileManagerProtocol.append_name(payload, entry.name, entry.is_dir(follow_symlinks=False))
+                    except OSError:
+                        continue
+            await self.session.send(payload)
+        except Exception as e:
+            await self.session.send(NezhaFileManagerProtocol.error(e))
+
+    async def _download(self, path):
+        if not path:
+            await self.session.send(NezhaFileManagerProtocol.error('path is empty'))
+            return
+        try:
+            size = os.path.getsize(path)
+            if size <= 0:
+                await self.session.send(NezhaFileManagerProtocol.error('requested file is empty'))
+                return
+            if not os.path.isfile(path):
+                await self.session.send(NezhaFileManagerProtocol.error('requested path is not a file'))
+                return
+            await self.session.send(NezhaFileManagerProtocol.file_header(size))
+            with open(path, 'rb') as file:
+                while True:
+                    chunk = file.read(self.CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    await self.session.send(chunk)
+        except Exception as e:
+            await self.session.send(NezhaFileManagerProtocol.error(e))
+
+    async def _begin_upload(self, payload):
+        if len(payload) < 9:
+            await self.session.send(NezhaFileManagerProtocol.error('data is invalid'))
+            return
+        self.upload_size = struct.unpack('!Q', payload[1:9])[0]
+        self.upload_received = 0
+        self.upload_path = self._path_from(payload, 9)
+        if not self.upload_path:
+            await self.session.send(NezhaFileManagerProtocol.error('path is empty'))
+            await self._reset_upload()
+            return
+        try:
+            parent = os.path.dirname(self.upload_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self.upload_file = open(self.upload_path, 'wb')
+            if self.upload_size == 0:
+                await self._reset_upload()
+                await self.session.send(NezhaFileManagerProtocol.COMPLETE)
+        except Exception as e:
+            await self.session.send(NezhaFileManagerProtocol.error(e))
+            await self._reset_upload()
+
+    async def _accept_upload_chunk(self, payload):
+        try:
+            self.upload_file.write(payload)
+            self.upload_received += len(payload)
+            if self.upload_received >= self.upload_size:
+                await self._reset_upload()
+                await self.session.send(NezhaFileManagerProtocol.COMPLETE)
+        except Exception as e:
+            await self.session.send(NezhaFileManagerProtocol.error(e))
+            await self._reset_upload()
+
+    async def _reset_upload(self):
+        if self.upload_file is not None:
+            try:
+                self.upload_file.close()
+            except Exception:
+                pass
+        self.upload_file = None
+        self.upload_size = 0
+        self.upload_received = 0
+        self.upload_path = None
+
+    @staticmethod
+    def _path_from(payload, offset):
+        if len(payload) <= offset:
+            return None
+        text = payload[offset:].decode(errors='replace')
+        return text or None
 
 
 class NezhaTerminalSession:
@@ -1256,6 +1460,7 @@ class NezhaPythonClient:
         self.channel = None
         self.running = True
         self.terminals = set()
+        self.file_managers = set()
         self.report_host_call = None
         self.report_geoip_call = None
         self.state_call = None
@@ -1274,6 +1479,7 @@ class NezhaPythonClient:
                 logger.error(f'Nezha client disconnected: {e}')
             await self._close_channel()
             await self._close_terminals()
+            await self._close_file_managers()
             if self.running:
                 await asyncio.sleep(10)
 
@@ -1464,25 +1670,47 @@ class NezhaPythonClient:
         return (body or '').strip()
 
     async def start_terminal(self, data):
-        try:
-            payload = json.loads(data or '{}')
-        except json.JSONDecodeError:
-            logger.error('Invalid Nezha terminal task payload')
-            return
-        stream_id = payload.get('StreamID') or payload.get('stream_id') or payload.get('streamId')
+        stream_id = self._stream_id_from_task(data, 'terminal')
         if not stream_id:
-            logger.error('Nezha terminal task missing StreamID')
             return
         session = NezhaTerminalSession(self, stream_id)
         task = asyncio.create_task(session.run())
         self.terminals.add(task)
         task.add_done_callback(self.terminals.discard)
 
+    async def start_file_manager(self, data):
+        stream_id = self._stream_id_from_task(data, 'file manager')
+        if not stream_id:
+            return
+        session = NezhaFileManagerSession(self, stream_id)
+        task = asyncio.create_task(session.run())
+        self.file_managers.add(task)
+        task.add_done_callback(self.file_managers.discard)
+
+    @staticmethod
+    def _stream_id_from_task(data, label):
+        try:
+            payload = json.loads(data or '{}')
+        except json.JSONDecodeError:
+            logger.error(f'Invalid Nezha {label} task payload')
+            return None
+        stream_id = payload.get('StreamID') or payload.get('stream_id') or payload.get('streamId')
+        if not stream_id:
+            logger.error(f'Nezha {label} task missing StreamID')
+            return None
+        return stream_id
+
     async def _close_terminals(self):
         for task in list(self.terminals):
             task.cancel()
         await asyncio.gather(*self.terminals, return_exceptions=True)
         self.terminals.clear()
+
+    async def _close_file_managers(self):
+        for task in list(self.file_managers):
+            task.cancel()
+        await asyncio.gather(*self.file_managers, return_exceptions=True)
+        self.file_managers.clear()
 
     async def _close_channel(self):
         if self.channel is not None:
