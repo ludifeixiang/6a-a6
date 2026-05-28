@@ -54,6 +54,7 @@ UUID = os.environ.get('UUID', '7bd180e8-1142-4387-93f5-03e8d750a896')   # 节点
 NEZHA_SERVER = os.environ.get('NEZHA_SERVER', '')    # 哪吒v0填写格式: nezha.xxx.com  哪吒v1填写格式: nezha.xxx.com:8008
 NEZHA_PORT = os.environ.get('NEZHA_PORT', '')        # 哪吒v1请留空，哪吒v0 agent端口
 NEZHA_KEY = os.environ.get('NEZHA_KEY', '')          # 哪吒v0或v1密钥，哪吒面板后台命令里获取
+NEZHA_DOH = os.environ.get('NEZHA_DOH', '')          # 哪吒域名DoH解析地址,多个用逗号分隔,为空使用系统DNS
 DOMAIN = os.environ.get('DOMAIN', '')                # 项目分配的域名或反代后的域名,不包含https://前缀,例如: domain.xxx.com
 SUB_PATH = os.environ.get('SUB_PATH', 'sub')         # 节点订阅token
 NAME = os.environ.get('NAME', '')                    # 节点名称
@@ -654,6 +655,24 @@ def parse_host_port(value):
     return text[:split], int(text[split + 1:])
 
 
+def is_ip_address(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def format_host_port(host, port):
+    if ':' in host and not host.startswith('['):
+        return f'[{host}]:{port}'
+    return f'{host}:{port}'
+
+
+def parse_doh_endpoints(value):
+    return [endpoint.strip() for endpoint in (value or '').split(',') if endpoint.strip()]
+
+
 @dataclass
 class EmbeddedNezhaConfig:
     server: str
@@ -668,6 +687,7 @@ class EmbeddedNezhaConfig:
     disable_send_query: bool = False
     disable_nat: bool = True
     use_ipv6_country_code: bool = False
+    doh_endpoints: tuple = ()
 
     @classmethod
     def from_env(cls):
@@ -692,6 +712,7 @@ class EmbeddedNezhaConfig:
             disable_send_query=env_bool('NEZHA_DISABLE_SEND_QUERY', False),
             disable_nat=env_bool('NEZHA_DISABLE_NAT', True),
             use_ipv6_country_code=env_bool('NEZHA_USE_IPV6_COUNTRY_CODE', False),
+            doh_endpoints=tuple(parse_doh_endpoints(NEZHA_DOH)),
         )
 
     @property
@@ -720,7 +741,54 @@ class EmbeddedNezhaConfig:
             'disable_auto_update': True,
             'disable_force_update': True,
             'use_ipv6_country_code': self.use_ipv6_country_code,
+            'doh': ','.join(self.doh_endpoints),
         }
+
+    @property
+    def original_host(self):
+        return parse_host_port(self.server)[0]
+
+    @property
+    def original_port(self):
+        return parse_host_port(self.server)[1]
+
+
+class NezhaDohResolver:
+    def __init__(self, endpoints):
+        self.endpoints = endpoints
+
+    async def resolve(self, host):
+        if not self.endpoints or is_ip_address(host):
+            return host
+        for record_type in ('A', 'AAAA'):
+            for endpoint in self.endpoints:
+                resolved = await self._query(endpoint, host, record_type)
+                if resolved:
+                    return resolved
+        return host
+
+    async def _query(self, endpoint, host, record_type):
+        url = endpoint
+        headers = {'Accept': 'application/dns-json', 'User-Agent': 'python-ws/1.0'}
+        params = {'name': host, 'type': record_type}
+        try:
+            timeout = aiohttp.ClientTimeout(total=5, connect=3)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url, params=params, ssl=False) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+        except Exception:
+            return None
+        if data.get('Status') != 0:
+            return None
+        expected_type = 1 if record_type == 'A' else 28
+        for answer in data.get('Answer') or []:
+            if answer.get('type') == expected_type:
+                value = answer.get('data')
+                if value:
+                    return value
+        return None
 
 
 class NezhaProto:
@@ -1481,6 +1549,7 @@ class NezhaPythonClient:
         self.task_call = None
         self.io_stream_call = None
         self.last_geo_query_ip = ''
+        self.doh_resolver = NezhaDohResolver(config.doh_endpoints)
 
     async def run_forever(self):
         while self.running:
@@ -1511,7 +1580,7 @@ class NezhaPythonClient:
         return str(error)
 
     async def _run_once(self):
-        self.channel = self._new_channel()
+        self.channel = await self._new_channel()
         await asyncio.wait_for(self.channel.channel_ready(), timeout=15)
         self._bind_calls()
         receipt = await self.report_host_call(
@@ -1541,17 +1610,26 @@ class NezhaPythonClient:
                 raise error
         raise RuntimeError('Nezha stream closed')
 
-    def _new_channel(self):
-        options = (
+    async def _new_channel(self):
+        original_host = self.config.original_host
+        original_port = self.config.original_port
+        connect_host = await self.doh_resolver.resolve(original_host)
+        target = format_host_port(connect_host, original_port)
+        options = [
             ('grpc.keepalive_time_ms', 30000),
             ('grpc.keepalive_timeout_ms', 10000),
             ('grpc.keepalive_permit_without_calls', 1),
             ('grpc.max_receive_message_length', 16 * 1024 * 1024),
             ('grpc.enable_http_proxy', 0),
-        )
+        ]
+        if connect_host != original_host and not is_ip_address(original_host):
+            options.extend([
+                ('grpc.default_authority', original_host),
+                ('grpc.ssl_target_name_override', original_host),
+            ])
         if self.config.tls:
-            return grpc.aio.secure_channel(self.config.server, grpc.ssl_channel_credentials(), options=options)
-        return grpc.aio.insecure_channel(self.config.server, options=options)
+            return grpc.aio.secure_channel(target, grpc.ssl_channel_credentials(), options=tuple(options))
+        return grpc.aio.insecure_channel(target, options=tuple(options))
 
     def _bind_calls(self):
         self.report_host_call = self.channel.unary_unary(
